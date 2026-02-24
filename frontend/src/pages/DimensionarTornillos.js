@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import apiClient from '../utils/apiClient';
 
 const SCREW_DIAMETERS = ['1/4', '3/8', '1/2', '5/8', '3/4', '7/8', '1', '1 1/8', '1 1/4', '1 1/2', '2', '2 1/2', '6 1/2', '6 3/4', '7'];
 const DIAMETER_VALUES = {
@@ -116,16 +117,9 @@ const DimensionarTornillos = () => {
                 recommended_length_in: closestLength || null
             };
 
-            const response = await fetch('http://localhost:8001/api/v1/tools/screw/', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${token}`
-                },
-                body: JSON.stringify(data)
-            });
+            const response = await apiClient.post('/api/v1/tools/screw/', data);
 
-            if (!response.ok) {
+            if (response.status !== 200 && response.status !== 201) {
                 throw new Error('Error al guardar el cálculo');
             }
 
@@ -145,14 +139,9 @@ const DimensionarTornillos = () => {
         try {
             setIsLoadingList(true);
             const token = localStorage.getItem('access_token');
-            const response = await fetch('http://localhost:8001/api/v1/tools/screw/', {
-                headers: {
-                    'Authorization': `Bearer ${token}`
-                }
-            });
-            if (!response.ok) throw new Error('Failed to fetch');
-            const data = await response.json();
-            setSavedCalculations(data);
+            const response = await apiClient.get('/api/v1/tools/screw/');
+            if (response.status !== 200) throw new Error('Failed to fetch');
+            setSavedCalculations(response.data);
         } catch (error) {
             console.error('Error fetching calculations:', error);
         } finally {
@@ -163,13 +152,8 @@ const DimensionarTornillos = () => {
     const deleteCalculation = async (id) => {
         try {
             const token = localStorage.getItem('access_token');
-            const response = await fetch(`http://localhost:8001/api/v1/tools/screw/${id}`, {
-                method: 'DELETE',
-                headers: {
-                    'Authorization': `Bearer ${token}`
-                }
-            });
-            if (!response.ok) throw new Error('Failed to delete');
+            const response = await apiClient.delete(`/api/v1/tools/screw/${id}`);
+            if (response.status !== 204 && response.status !== 200) throw new Error('Failed to delete');
             setSavedCalculations(prev => prev.filter(calc => calc.id !== id));
         } catch (error) {
             console.error('Error deleting calculation:', error);
