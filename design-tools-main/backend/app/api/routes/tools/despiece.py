@@ -1,0 +1,463 @@
+import logging
+from collections import Counter
+from typing import Any, Dict, List, TypedDict, cast
+
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+
+from app.api import deps
+from app.schemas.tools.despiece import (
+    BeamDetailPayload,
+    BeamPresetResponse,
+    DetailingRequest,
+    DetailingResponse,
+)
+from app.schemas.design import (
+    DesignCreate,
+    DesignRead,
+    DespieceVigaCreate,
+    DespieceVigaRead,
+    DespieceVigaUpdate,
+)
+from app.services import design_service, rebar_service
+from app.services.detailing_service import BeamDetailingService
+from app import models
+
+router = APIRouter(prefix="/tools/despiece", tags=["tools: despiece de vigas"])
+
+detailing_service = BeamDetailingService()
+logger = logging.getLogger(__name__)
+
+
+class BarConfig(TypedDict):
+    diameter: str
+    quantity: int
+
+
+FC_COLUMN_MAP = {
+    "21 MPa (3000 psi)": "fc_21_mpa_m",
+    "24 MPa (3500 psi)": "fc_24_mpa_m",
+    "28 MPa (4000 psi)": "fc_28_mpa_m",
+    "32 MPa (4600 psi)": "fc_28_mpa_m",
+}
+
+DEFAULT_LAP_SPLICE = 0.75
+DEFAULT_LAP_LOCATION = "Calculado automáticamente"
+
+
+def _normalize_mark(bar_mark: str) -> str:
+    mark = (bar_mark or "").strip()
+    return mark if mark.startswith("#") else f"#{mark}"
+
+
+def _build_lap_splice_lookup(db: Session) -> Dict[str, Dict[str, float]]:
+    records = rebar_service.list_lap_splice_lengths(db)
+    lookup: Dict[str, Dict[str, float]] = {}
+    for record in records:
+        mark = _normalize_mark(str(getattr(record, "bar_mark", "")))
+        if not mark:
+            continue
+        lookup[mark] = {
+            "fc_21_mpa_m": float(getattr(record, "fc_21_mpa_m", DEFAULT_LAP_SPLICE)),
+            "fc_24_mpa_m": float(getattr(record, "fc_24_mpa_m", DEFAULT_LAP_SPLICE)),
+            "fc_28_mpa_m": float(getattr(record, "fc_28_mpa_m", DEFAULT_LAP_SPLICE)),
+        }
+    return lookup
+
+
+def _collect_diameters(payload_data: Dict[str, Any]) -> set[str]:
+    diameters: set[str] = set()
+    for field in ("top_bars_config", "bottom_bars_config"):
+        for group in payload_data.get(field) or []:
+            diameter = _normalize_mark(group.get("diameter", ""))
+            if len(diameter) > 1:
+                diameters.add(diameter)
+
+    for field in ("top_bar_diameters", "bottom_bar_diameters"):
+        for diameter in payload_data.get(field) or []:
+            normalized = _normalize_mark(diameter)
+            if len(normalized) > 1:
+                diameters.add(normalized)
+
+    return diameters
+
+
+def _calculate_lap_splice_length(payload_data: Dict[str, Any], lookup: Dict[str, Dict[str, float]]) -> float:
+    if not lookup:
+        return DEFAULT_LAP_SPLICE
+
+    fc_key = FC_COLUMN_MAP.get(payload_data.get("concrete_strength", ""))
+    if not fc_key:
+        return DEFAULT_LAP_SPLICE
+
+    diameters = _collect_diameters(payload_data)
+    if not diameters:
+        return DEFAULT_LAP_SPLICE
+
+    lengths: List[float] = []
+    for diameter in diameters:
+        values = lookup.get(diameter)
+        if values is None:
+            continue
+        length = values.get(fc_key)
+        if length is None:
+            continue
+        lengths.append(float(length))
+
+    return max(lengths) if lengths else DEFAULT_LAP_SPLICE
+
+
+def _inject_lap_splice_metadata(payload: Dict[str, Any], lookup: Dict[str, Dict[str, float]]) -> Dict[str, Any]:
+    enriched = payload.copy()
+    enriched["lap_splice_length_min_m"] = _calculate_lap_splice_length(enriched, lookup)
+    if not enriched.get("lap_splice_location"):
+        enriched["lap_splice_location"] = DEFAULT_LAP_LOCATION
+    return enriched
+
+
+@router.get("/presets", response_model=BeamPresetResponse)
+def get_presets():
+    return BeamPresetResponse(
+        fc_options=["21 MPa (3000 psi)", "24 MPa (3500 psi)", "28 MPa (4000 psi)", "32 MPa (4600 psi)"],
+        fy_options=["420 MPa (Grado 60)", "520 MPa (Grado 75)"],
+        hook_options=["90", "135", "180"],
+        max_bar_lengths=["6m", "9m", "12m"],
+        energy_classes=["DES", "DMO", "DMI"],
+        diameter_options=["#3", "#4", "#5", "#6", "#7", "#8", "#9", "#10", "#11", "#14", "#18"],
+    )
+
+
+@router.post("/compute-detailing", response_model=DetailingResponse)
+def compute_beam_detailing(
+    *,
+    request: DetailingRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(deps.get_db_session),
+    current_user: models.User = Depends(deps.get_current_user),
+):
+    try:
+        user_id = _get_user_id(current_user)
+        logger.info("Calculando despiece para usuario %s", user_id)
+        lap_lookup = _build_lap_splice_lookup(db)
+        base_request = request.model_dump(exclude_none=True)
+        request_data = _inject_lap_splice_metadata(base_request, lap_lookup)
+        request_data["lap_splice_lookup"] = lap_lookup
+        response = detailing_service.compute_detailing(request_data)
+
+        if response.success:
+            background_tasks.add_task(
+                log_detailing_computation,
+                user_id=user_id,
+                request_data=request_data,
+                response_data=response.model_dump(),
+            )
+
+        return response
+
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Error en compute_beam_detailing: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error interno al calcular despiece: {exc}",
+        ) from exc
+
+
+@router.post("/designs/{design_id}/compute-detailing", response_model=DetailingResponse)
+def compute_detailing_for_design(
+    *,
+    design_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(deps.get_db_session),
+    current_user: models.User = Depends(deps.get_current_user),
+):
+    try:
+        user_id = _get_user_id(current_user)
+        design = design_service.get_design(db, design_id=design_id, user_id=user_id)
+        if design is None or design.beam_despiece is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Diseño o despiece no encontrado",
+            )
+
+        despiece = design.beam_despiece
+        logger.info(
+            "Calculando despiece para diseño %s (despiece %s)",
+            design_id,
+            despiece.id,
+        )
+
+        normalized_spans = _normalize_span_geometries(despiece.span_geometries)
+
+        request_data = {
+            "span_geometries": normalized_spans,
+            "axis_supports": [
+                {"support_width_cm": width, "label": f"EJE {index + 1}"}
+                for index, width in enumerate(despiece.support_widths_cm or [])
+            ],
+            "top_bars_config": _extract_bar_config(despiece.top_bar_diameters or []),
+            "bottom_bars_config": _extract_bar_config(despiece.bottom_bar_diameters or []),
+            "segment_reinforcements": despiece.segment_reinforcements or [],
+            "has_initial_cantilever": despiece.has_cantilevers,
+            "has_final_cantilever": despiece.has_cantilevers,
+            "cover_cm": despiece.cover_cm,
+            "max_rebar_length_m": despiece.max_rebar_length_m,
+            "hook_type": despiece.hook_type,
+            "energy_dissipation_class": despiece.energy_dissipation_class,
+            "concrete_strength": despiece.concrete_strength,
+            "reinforcement": despiece.reinforcement,
+            "lap_splice_length_min_m": despiece.lap_splice_length_min_m,
+        }
+
+        lap_lookup = _build_lap_splice_lookup(db)
+        request_data = _inject_lap_splice_metadata(request_data, lap_lookup)
+        request_data["lap_splice_lookup"] = lap_lookup
+
+        response = detailing_service.compute_detailing(request_data)
+
+        if response.success and response.results:
+            despiece.update_detailing(response.model_dump())
+            db.add(despiece)
+            db.commit()
+            db.refresh(despiece)
+
+            background_tasks.add_task(
+                log_design_detailing,
+                design_id=design_id,
+                user_id=user_id,
+                response_data=response.model_dump(),
+            )
+
+        return response
+
+    except HTTPException:
+        raise
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("Error en compute_detailing_for_design: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error interno al calcular despiece para diseño: {exc}",
+        ) from exc
+
+
+@router.get("/designs/{design_id}/detailing", response_model=DetailingResponse)
+def get_detailing_for_design(
+    *,
+    design_id: int,
+    db: Session = Depends(deps.get_db_session),
+    current_user: models.User = Depends(deps.get_current_user),
+):
+    user_id = _get_user_id(current_user)
+    design = design_service.get_design(db, design_id=design_id, user_id=user_id)
+    if design is None or design.beam_despiece is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Diseño o despiece no encontrado",
+        )
+
+    despiece = design.beam_despiece
+
+    if not despiece.detailing_computed or not despiece.detailing_results:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="El despiece no ha sido calculado aún. Use POST /compute-detailing primero.",
+        )
+
+    return DetailingResponse(
+        success=True,
+        results=despiece.detailing_results,
+        message="Despiece recuperado de la base de datos",
+        computation_time_ms=None,
+    )
+
+
+@router.get("/designs/{design_id}/detailing/validation")
+def get_detailing_validation(
+    *,
+    design_id: int,
+    db: Session = Depends(deps.get_db_session),
+    current_user: models.User = Depends(deps.get_current_user),
+):
+    user_id = _get_user_id(current_user)
+    design = design_service.get_design(db, design_id=design_id, user_id=user_id)
+    if design is None or design.beam_despiece is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Diseño o despiece no encontrado",
+        )
+
+    despiece = design.beam_despiece
+
+    if not despiece.detailing_computed:
+        return {"computed": False, "message": "Despiece no calculado"}
+
+    return {
+        "computed": True,
+        "validation_passed": despiece.detailing_results.get("validation_passed", False),
+        "warnings": despiece.detailing_warnings or [],
+        "warning_count": len(despiece.detailing_warnings or []),
+        "optimization_score": despiece.optimization_score,
+        "computed_at": despiece.detailing_computed_at.isoformat() if despiece.detailing_computed_at else None,
+        "version": despiece.detailing_version,
+    }
+
+
+@router.post("/designs/{design_id}/detailing/recompute")
+def recompute_detailing(
+    *,
+    design_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(deps.get_db_session),
+    current_user: models.User = Depends(deps.get_current_user),
+):
+    return compute_detailing_for_design(
+        design_id=design_id,
+        background_tasks=background_tasks,
+        db=db,
+        current_user=current_user,
+    )
+
+
+@router.post("/designs", response_model=DesignRead, status_code=status.HTTP_201_CREATED)
+def create_beam_design(
+    *,
+    payload: BeamDetailPayload,
+    db: Session = Depends(deps.get_db_session),
+    current_user: models.User = Depends(deps.get_current_user),
+):
+    user_id = _get_user_id(current_user)
+    lap_lookup = _build_lap_splice_lookup(db)
+    payload_data = payload.model_dump()
+    enriched_payload = _inject_lap_splice_metadata(payload_data, lap_lookup)
+    payload = BeamDetailPayload.model_validate(enriched_payload)
+    despiece_fields = set(DespieceVigaCreate.model_fields.keys())
+    despiece_payload = DespieceVigaCreate(**payload.model_dump(include=despiece_fields))
+    settings_data = payload.model_dump(exclude=despiece_fields)
+
+    design_in = DesignCreate(
+        title=f"Despiece {payload.beam_label}",
+        description=f"Proyecto {payload.project_name}",
+        design_type="beam_detailing",
+        settings=settings_data,
+        despiece_viga=despiece_payload,
+    )
+    return design_service.create_design(db, design_in=design_in, user_id=user_id)
+
+
+@router.get("/designs/{design_id}", response_model=DespieceVigaRead)
+def get_beam_despiece(
+    *,
+    design_id: int,
+    db: Session = Depends(deps.get_db_session),
+    current_user: models.User = Depends(deps.get_current_user),
+):
+    user_id = _get_user_id(current_user)
+    design = design_service.get_design(db, design_id=design_id, user_id=user_id)
+    if design is None or design.beam_despiece is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Despiece no encontrado")
+    return design.beam_despiece
+
+
+@router.put("/designs/{design_id}", response_model=DespieceVigaRead)
+def update_beam_despiece(
+    *,
+    design_id: int,
+    payload: DespieceVigaUpdate,
+    db: Session = Depends(deps.get_db_session),
+    current_user: models.User = Depends(deps.get_current_user),
+):
+    user_id = _get_user_id(current_user)
+    updated = design_service.update_despiece_for_design(
+        db,
+        design_id=design_id,
+        user_id=user_id,
+        despiece_in=payload,
+    )
+    if updated is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Despiece no encontrado")
+    return updated
+
+
+@router.delete("/designs/{design_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_beam_despiece(
+    *,
+    design_id: int,
+    db: Session = Depends(deps.get_db_session),
+    current_user: models.User = Depends(deps.get_current_user),
+):
+    deleted = design_service.delete_despiece_for_design(
+        db,
+        design_id=design_id,
+        user_id=_get_user_id(current_user),
+    )
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Despiece no encontrado")
+
+
+def _extract_bar_config(diameters: List[str]) -> List[BarConfig]:
+    if not diameters:
+        return []
+    counts = Counter(diameters)
+    return [{"diameter": diameter, "quantity": count} for diameter, count in counts.items()]
+
+
+def _normalize_span_geometries(spans: List[Dict[str, Any]] | None) -> List[Dict[str, Any]]:
+    if not spans:
+        return []
+
+    normalized: List[Dict[str, Any]] = []
+
+    for span in spans:
+        if not isinstance(span, dict):
+            continue
+
+        base_value = _first_numeric(
+            span.get("section_base_cm"),
+            span.get("section_width_cm"),
+            span.get("base_cm"),
+            span.get("width_cm"),
+        )
+        height_value = _first_numeric(
+            span.get("section_height_cm"),
+            span.get("height_cm"),
+        )
+
+        normalized_span = dict(span)
+        if base_value is not None:
+            normalized_span["section_base_cm"] = base_value
+            normalized_span.setdefault("section_width_cm", base_value)
+        if height_value is not None:
+            normalized_span["section_height_cm"] = height_value
+
+        normalized.append(normalized_span)
+
+    return normalized
+
+
+def _first_numeric(*values: Any) -> float | None:
+    for value in values:
+        numeric = _coerce_float(value)
+        if numeric is not None:
+            return numeric
+    return None
+
+
+def _coerce_float(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _get_user_id(user: models.User) -> int:
+    user_id = getattr(user, "id", None)
+    if user_id is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Usuario inválido")
+    return cast(int, user_id)
+
+
+async def log_detailing_computation(user_id: int, request_data: Dict, response_data: Dict):
+    logger.info("Despiece calculado para usuario %s", user_id)
+
+
+async def log_design_detailing(design_id: int, user_id: int, response_data: Dict):
+    logger.info("Despiece calculado para diseño %s por usuario %s", design_id, user_id)
