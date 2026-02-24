@@ -18,9 +18,12 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install runtime dependencies
+# Install runtime dependencies and ODAFileConverter
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libpq5 \
+    libpq5 wget \
+    && wget -qO /tmp/oda.deb "https://www.opendesign.com/guestfiles/get?filename=ODAFileConverter_QT6_lnxX64_8.3dll_26.12.deb" \
+    && apt-get install -y /tmp/oda.deb \
+    && rm /tmp/oda.deb \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy installed packages from builder
