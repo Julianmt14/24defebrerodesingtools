@@ -56,10 +56,14 @@ const Login = ({ onLogin }) => {
       const API = import.meta.env.VITE_API_URL?.replace(/\/$/, "");
       if (!API) throw new Error("VITE_API_URL no está configurada");
 
+      const formData = new URLSearchParams();
+      formData.append('username', data.identifier.trim());
+      formData.append('password', data.password);
+
       const response = await fetch(`${API}/api/v1/auth/login`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: data.identifier.trim(), password: data.password }),
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: formData,
       });
 
       const responseData = await response.json();
