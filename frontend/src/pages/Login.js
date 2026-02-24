@@ -53,17 +53,21 @@ const Login = ({ onLogin }) => {
   const onSubmit = async (data) => {
     setIsLoading(true);
     try {
-      const formData = new URLSearchParams();
-      formData.append('username', data.identifier.trim());
-      formData.append('password', data.password);
-
-      const response = await apiClient.post('/api/v1/auth/login', formData, {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        skipAuth: true,
+      const API = import.meta.env.VITE_API_URL;
+      const response = await fetch(`${API}/api/v1/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: data.identifier.trim(), password: data.password }),
       });
 
-      const token = response.data?.access_token;
-      const refreshToken = response.data?.refresh_token;
+      const responseData = await response.json();
+
+      if (!response.ok) {
+        throw new Error(responseData?.detail || 'Error al iniciar sesión');
+      }
+
+      const token = responseData.access_token;
+      const refreshToken = responseData.refresh_token;
       if (!token) {
         throw new Error('No se recibió el token de acceso.');
       }
