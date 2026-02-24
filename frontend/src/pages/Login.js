@@ -53,7 +53,9 @@ const Login = ({ onLogin }) => {
   const onSubmit = async (data) => {
     setIsLoading(true);
     try {
-      const API = import.meta.env.VITE_API_URL;
+      const API = import.meta.env.VITE_API_URL?.replace(/\/$/, "");
+      if (!API) throw new Error("VITE_API_URL no está configurada");
+
       const response = await fetch(`${API}/api/v1/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -76,7 +78,7 @@ const Login = ({ onLogin }) => {
       toast.success('¡Bienvenido de nuevo!');
       navigate('/');
     } catch (error) {
-      const backendMessage = error.response?.data?.detail;
+      const backendMessage = error.response?.data?.detail || error.message;
       toast.error(backendMessage || 'Credenciales incorrectas. Por favor, intenta de nuevo.');
     } finally {
       setIsLoading(false);
