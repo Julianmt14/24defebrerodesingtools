@@ -170,7 +170,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES=30
 
 ## Licencia
 
-Este proyecto está bajo la Licencia MIT.
+Este proyecto está bajo la Licencia MIT 1.
 
 ## Contacto
 
